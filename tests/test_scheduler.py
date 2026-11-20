@@ -332,6 +332,104 @@ def test_failed_dispatch_after_release_keeps_release(scheduler, monkeypatch):
     assert job(scheduler, "b")["status"] == "running"
 
 
+def test_release_of_due_lease_with_failed_dispatch_leaves_expiry_and_queue(
+    scheduler, clock, monkeypatch
+):
+    """An already-due lease is 409, and a failed dispatch keeps it running.
+
+    The expiry sweep and the follow-up dispatch are one transaction: when
+    dispatch fails, the due job keeps its status, slots, and the queue keeps
+    its order.  The next successful pass reports the expiry and dispatches.
+    """
+    scheduler.configure_node("n1", 2)
+    scheduler.submit_job("a", 2, 5)
+    scheduler.submit_job("b", 2, 5)
+    assert job(scheduler, "b")["status"] == "queued"
+
+    clock.advance(5)  # a is due, but no sweep has written it yet
+    before = _raw_jobs(scheduler)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_allocate",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plane down")),
+    )
+    with pytest.raises(LeaseNotHeldError):
+        scheduler.release_job("a")
+
+    assert _raw_jobs(scheduler) == before
+    a = job(scheduler, "a")
+    assert a["status"] == "running"
+    assert a["assigned_node"] == "n1"
+    assert job(scheduler, "b")["status"] == "queued"
+    assert job(scheduler, "b")["queue_position"] == 1
+    assert occupied(scheduler) == 2
+
+    # A failed pass reports nothing; it did not half-apply the sweep.
+    assert scheduler.tick() == []
+
+    monkeypatch.undo()
+    events = scheduler.tick()
+    types = {(e["type"], e["job_id"]) for e in events}
+    assert ("expired", "a") in types
+    assert ("dispatched", "b") in types
+    assert job(scheduler, "a")["status"] == "expired"
+    assert job(scheduler, "b")["status"] == "running"
+    assert scheduler.list_nodes()[0]["used_slots"] == 2
+
+
+def test_release_due_lease_returns_409_and_sweep_dispatch_apply_together(
+    scheduler, clock
+):
+    scheduler.configure_node("n1", 2)
+    scheduler.submit_job("a", 2, 5)
+    scheduler.submit_job("b", 2, 5)
+    clock.advance(5)  # a is due; nothing has swept it yet
+
+    with pytest.raises(LeaseNotHeldError):
+        scheduler.release_job("a")
+
+    # The rejected return did not write an expiry by itself, but the
+    # scheduling pass that follows reported and applied the sweep together
+    # with the dispatch.
+    a = job(scheduler, "a")
+    assert a["status"] == "expired"
+    assert a["ended_at"] is not None
+    b = job(scheduler, "b")
+    assert b["status"] == "running"
+    assert b["assigned_node"] == "n1"
+    assert scheduler.list_nodes()[0]["used_slots"] == 2
+
+
+def test_release_of_active_lease_with_failed_dispatch_stays_completed(
+    scheduler, monkeypatch
+):
+    """A valid release commits alone; a failed dispatch cannot undo it."""
+    scheduler.configure_node("n1", 2)
+    scheduler.submit_job("a", 2, 60)
+    scheduler.submit_job("b", 2, 60)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_allocate",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plane down")),
+    )
+    released = scheduler.release_job("a")
+    assert released["status"] == "completed"
+    a = job(scheduler, "a")
+    assert a["status"] == "completed"
+    assert a["ended_at"] is not None
+    assert job(scheduler, "b")["status"] == "queued"
+    assert job(scheduler, "b")["queue_position"] == 1
+    assert occupied(scheduler) == 0
+
+    monkeypatch.undo()
+    events = scheduler.tick()
+    assert ("dispatched", "b") in {(e["type"], e["job_id"]) for e in events}
+    assert job(scheduler, "b")["status"] == "running"
+    assert job(scheduler, "a")["status"] == "completed"
+
+
 def test_concurrent_ticking_never_oversubscribes(db_path, clock):
     scheduler = Scheduler(Store(db_path), clock=clock)
     scheduler.configure_node("n1", 5)

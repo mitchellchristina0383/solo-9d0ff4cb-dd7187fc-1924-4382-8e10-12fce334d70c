@@ -168,6 +168,63 @@ def test_expiry_via_tick_endpoint(api):
     assert api.get("/jobs/b").json()["status"] == "running"
 
 
+def test_release_due_lease_with_failed_dispatch_is_409_and_keeps_state(
+    api, monkeypatch
+):
+    """A due lease is 409 even before the sweep, and a failed dispatch
+    leaves the expiry and queue untouched; the next successful pass applies
+    both."""
+    configure(api, "n1", 2)
+    submit(api, "a", 2, 5)
+    submit(api, "b", 2, 5)
+    api.clock.advance(5)
+
+    monkeypatch.setattr(
+        api.app.state.scheduler,
+        "_allocate",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plane down")),
+    )
+    response = api.post("/jobs/a/release")
+    assert response.status_code == 409
+    assert "expired" in response.json()["detail"]
+
+    a = api.get("/jobs/a").json()
+    assert a["status"] == "running"
+    assert a["assigned_node"] == "n1"
+    b = api.get("/jobs/b").json()
+    assert b["status"] == "queued"
+    assert b["queue_position"] == 1
+    assert api.get("/nodes/n1").json()["used_slots"] == 2
+
+    monkeypatch.undo()
+    events = api.post("/admin/tick").json()["events"]
+    pairs = {(e["type"], e["job_id"]) for e in events}
+    assert ("expired", "a") in pairs
+    assert ("dispatched", "b") in pairs
+    assert api.get("/jobs/a").json()["status"] == "expired"
+    assert api.get("/jobs/b").json()["status"] == "running"
+
+
+def test_release_active_lease_with_failed_dispatch_is_completed(api, monkeypatch):
+    configure(api, "n1", 2)
+    submit(api, "a", 2, 60)
+    submit(api, "b", 2, 60)
+
+    monkeypatch.setattr(
+        api.app.state.scheduler,
+        "_allocate",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("plane down")),
+    )
+    response = api.post("/jobs/a/release")
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert api.get("/jobs/b").json()["status"] == "queued"
+
+    monkeypatch.undo()
+    api.post("/admin/tick")
+    assert api.get("/jobs/b").json()["status"] == "running"
+
+
 def test_backfill_scenario_end_to_end(api):
     configure(api, "n1", 6)
     submit(api, "a", 2, 10)

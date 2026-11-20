@@ -95,8 +95,14 @@ Notes:
   occupancy are exactly as before, and the next tick/request retries. A
   failed dispatch never leaves a half-written allocation or a freed slot
   without its replacement.
-* Releases are committed before the follow-up dispatch pass, so a dispatch
-  failure cannot undo a successful release.
+* Returning a lease that is still active commits the release on its own, so a
+  subsequent dispatch failure cannot undo it: the job stays `completed` and
+  the next successful pass dispatches from the queue.
+* A lease that has reached its expiry instant is not returnable (`409`) even
+  if the expiry sweep has not written it yet. The sweep only ever commits as
+  part of a scheduling pass, together with the dispatch that follows it: if
+  dispatch fails, the due job stays `running` with its slots and the queue is
+  unchanged. The next successful pass reports the expiry and dispatches.
 * Duplicate `job_id` submissions return `409`; the unique constraint is the
   final arbiter under concurrent submissions.
 
@@ -112,7 +118,7 @@ Notes:
 | `POST` | `/jobs` | Submit a job (dispatches immediately if possible) |
 | `GET` | `/jobs?status=` | List jobs in submission order |
 | `GET` | `/jobs/{job_id}` | Status, assigned node, lease expiry, remaining time |
-| `POST` | `/jobs/{job_id}/release` | Return a running lease early |
+| `POST` | `/jobs/{job_id}/release` | Return a running lease early (409 once due) |
 | `GET` | `/queue/head` | Queue head's estimated earliest start |
 | `GET` | `/queue` | Queued jobs plus the head estimate |
 | `POST` | `/admin/tick` | Expire due leases and re-dispatch now |
@@ -180,7 +186,7 @@ app/db.py          SQLite schema, transactions, invariant triggers
 app/scheduler.py   FIFO + backfill policy, leases, expiry, head estimate
 app/models.py      Pydantic request/response models (drives /docs)
 app/main.py        FastAPI routes, error mapping, background reaper
-tests/             38 tests: policy, leases, rollback, concurrency, HTTP, SQL
+tests/             43 tests: policy, leases, rollback, concurrency, HTTP, SQL
 Dockerfile         production image (non-root, healthcheck)
 Dockerfile.test    image that runs pytest
 docker-compose.yml single service + named volume for the SQLite file

@@ -200,14 +200,20 @@ class Scheduler:
     def release_job(self, job_id: str) -> dict:
         """Return a running lease early.
 
-        The release itself is one transaction; the following dispatch pass is
-        separate, so a dispatch failure cannot undo the release or leave a
-        half-updated queue.
+        A valid release is committed on its own, so a later dispatch failure
+        cannot undo it: the job stays ``completed``.
+
+        A lease that has already reached its expiry instant is *not*
+        returnable, even if no expiry sweep has written it yet: the caller
+        gets ``409``.  The expiry sweep and the follow-up dispatch are one
+        transaction, so they take effect together.  If dispatch fails, due
+        leases keep their status and slots and the queue is untouched; the
+        next successful scheduling pass expires and dispatches them then.
         """
+        now = self.now_us()
         error: SchedulerError | None = None
         with self._lock:
             with self.store.transaction() as conn:
-                self._expire_due(conn, self.now_us(), events=[])
                 row = conn.execute(
                     "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
@@ -218,16 +224,27 @@ class Scheduler:
                         f"job {job_id!r} is {row['status']}, not running; "
                         "only an active lease can be returned"
                     )
+                elif row["expires_at_us"] is not None and row["expires_at_us"] <= now:
+                    # Due by the clock but possibly not swept yet.  Treat it
+                    # as expired (409) without writing the expiry here; the
+                    # scheduling pass below applies it together with dispatch.
+                    error = LeaseNotHeldError(
+                        f"job {job_id!r} lease expired at "
+                        f"{to_iso(row['expires_at_us'])}, not running; "
+                        "only an active lease can be returned"
+                    )
                 else:
                     conn.execute(
                         """
                         UPDATE jobs SET status = 'completed', ended_at_us = ?
                         WHERE seq = ? AND status = 'running'
                         """,
-                        (self.now_us(), row["seq"]),
+                        (now, row["seq"]),
                     )
-            # Re-dispatch even when the release request itself was rejected:
-            # the expiry sweep inside the transaction may have freed slots.
+            # Re-dispatch even when the release was rejected: the expiry
+            # sweep may free slots.  Expiry and dispatch share one
+            # transaction inside _try_schedule, so a dispatch failure rolls
+            # both back and the next pass retries.
             events = self._try_schedule()
             if events:
                 logger.info("dispatch after release: %s", events)
